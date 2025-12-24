@@ -21,17 +21,27 @@ const (
 	prepareInterval = 1 // 1 seconds
 )
 
-type Voter struct{}
+type Voter struct{
+	r *replica.Replica
+}
+
+func (v *Voter) SetReplica(r *replica.Replica) {
+	v.r = r
+}
 
 // NOTE: This is not idempotent.
 //      Same command might be executed for multiple times
 //      but the exection is slow now, so it is unlikely to happen
 func (v *Voter) Execute(c []message.Command) ([]interface{}, error) {
+	rate := 0.0
+	if v.r != nil {
+		rate = v.r.ConflictRate()
+	}
 	if c == nil || len(c) == 0 {
-		fmt.Fprintln(os.Stderr, "From: No op")
+		fmt.Fprintf(os.Stderr, "From: No op | conflict rate: %.4f\n", rate)
 	} else {
 		for i := range c {
-			fmt.Fprintln(os.Stderr, string(c[i]))
+			fmt.Fprintf(os.Stderr, "%s | conflict rate: %.4f\n", string(c[i]), rate)
 		}
 	}
 	return nil, nil
@@ -65,11 +75,12 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	voter := &Voter{}
 	param := &replica.Param{
 		Addrs:            addrs,
 		ReplicaId:        uint8(id),
 		Size:             uint8(len(addrs)),
-		StateMachine:     new(Voter),
+		StateMachine:     voter,
 		Transporter:      tr,
 		EnablePersistent: true,
 		Restore:          restore,
@@ -85,6 +96,7 @@ func main() {
 	if err != nil {
 		glog.Fatal(err)
 	}
+	voter.SetReplica(r)
 
 	fmt.Println("Done!")
 	fmt.Printf("Wait %d seconds to start\n", prepareInterval)
@@ -97,13 +109,15 @@ func main() {
 
 	rand.Seed(time.Now().UTC().UnixNano())
 	counter := 1
-	for {
-		time.Sleep(time.Millisecond * 500)
+	for i := 0; i < 20; i++ {
+		time.Sleep(time.Second)
 		c := "From: " + strconv.Itoa(id) + ", Command: " + strconv.Itoa(id) + ":" + strconv.Itoa(counter) + ", " + time.Now().String()
 		counter++
 
-		cmds := make([]message.Command, 0)
-		cmds = append(cmds, message.Command(c))
-		r.Propose(cmds...)
+		// if(counter <= 20) {
+			cmds := make([]message.Command, 0)
+			cmds = append(cmds, message.Command(c))
+			r.Propose(cmds...)
+		// }
 	}
 }

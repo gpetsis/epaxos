@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/go-distributed/epaxos/message"
+	"github.com/golang/glog"
 )
 
 // ****************************
@@ -557,8 +558,9 @@ func (i *Instance) commonPreAcceptedNextStep() (action uint8, msg message.Messag
 	// - all preaccept-ok
 	// - all preaccept-reply same (implied in abletofastpath())
 	// and they satisfy fast path (initial ballot)
-	if okCount == i.replica.fastQuorum() ||
-		replyCount == i.replica.fastQuorum() && i.ableToFastPath() {
+		if okCount == i.replica.fastQuorum() ||
+			replyCount == i.replica.fastQuorum() && i.ableToFastPath() {
+			i.replica.recordFastPath(i)
 		// TODO: persistent
 		i.enterCommitted()
 		return broadcastAction, i.makeCommit()
@@ -567,7 +569,8 @@ func (i *Instance) commonPreAcceptedNextStep() (action uint8, msg message.Messag
 	// slow path, we received quorum of
 	// - replies and they don't satisfy fast path.
 	// - a mix of preacept-ok/-reply implies different and deps.
-	if okCount+replyCount >= i.replica.quorum() && !i.ableToFastPath() {
+		if okCount+replyCount >= i.replica.quorum() && !i.ableToFastPath() {
+			i.replica.recordSlowPath(i)
 		// TODO: persistent
 		i.enterAcceptedAsSender()
 		return broadcastAction, i.makeAccept()
@@ -1044,6 +1047,15 @@ func (i *Instance) enterAcceptedAsReceiver() {
 func (i *Instance) enterCommitted() {
 	i.checkStatus(nilStatus, preAccepted, preparing, accepted)
 	i.status = committed
+	i.replica.logConflictRate()
+	// instrumentation: record commit latency for local proposals
+	if i.rowId == i.replica.Id {
+		if start, ok := i.replica.proposalStartTimes[i.id]; ok {
+			lat := time.Since(start)
+			glog.Infof("Latency[commit] rid=%d iid=%d latency=%s", i.rowId, i.id, lat.String())
+			i.replica.commitTimes[i.id] = time.Now()
+		}
+	}
 	close(i.CommittedNotify)
 }
 

@@ -27,8 +27,9 @@ import (
 )
 
 // #if test
-var v1Log = glog.V(0)
-var v2Log = glog.V(0)
+// Reduce default verbosity; enable with -v=2 or higher.
+var v1Log = glog.V(2)
+var v2Log = glog.V(2)
 
 // #else
 // var v1Log = glog.V(1)
@@ -96,6 +97,9 @@ type Replica struct {
 	Addrs           []string
 	Transporter     epaxos.Transporter
 
+	fastPathCount uint64
+	slowPathCount uint64
+
 	// tarjan SCC
 	sccStack   *list.List
 	sccResults [][]*Instance
@@ -116,6 +120,15 @@ type Replica struct {
 	// persistent store
 	enablePersistent bool
 	store            *persistent.LevelDB
+
+	// instrumentation
+	proposalStartTimes map[uint64]time.Time // local proposals: iid -> start time
+	commitTimes        map[uint64]time.Time // optional: iid -> commit time
+	pathByInstance     map[uint64]string     // local: iid -> "fast"|"slow"
+	fastLatencyTotal   time.Duration
+	fastLatencyCount   uint64
+	slowLatencyTotal   time.Duration
+	slowLatencyCount   uint64
 }
 
 type Param struct {
@@ -210,6 +223,11 @@ func New(param *Param) (*Replica, error) {
 		stop:             make(chan struct{}),
 		enableBatching:   param.EnableBatching,
 		enablePersistent: param.EnablePersistent,
+
+		// initialize instrumentation fields
+		proposalStartTimes: make(map[uint64]time.Time),
+		commitTimes:        make(map[uint64]time.Time),
+		pathByInstance:     make(map[uint64]string),
 	}
 
 	var path string
@@ -394,6 +412,9 @@ func (r *Replica) batchPropose(batchedRequests *[]*proposeRequest) {
 	iid := r.ProposeNum
 	proposal := message.NewPropose(r.Id, iid, cmds)
 
+	// instrumentation: record proposal start time for local instance
+	r.proposalStartTimes[iid] = time.Now()
+
 	// update propose num
 	r.ProposeNum++
 	if r.IsCheckpoint(r.ProposeNum) {
@@ -526,6 +547,37 @@ func (r *Replica) makeInitialBallot() *message.Ballot {
 
 func (r *Replica) makeInitialDeps() message.Dependencies {
 	return make(message.Dependencies, r.Size)
+}
+
+func (r *Replica) recordFastPath(i *Instance) {
+	fmt.Printf("Replica %d went on the fast path\n", r.Id)
+	r.fastPathCount++
+	if i.rowId == r.Id {
+		r.pathByInstance[i.id] = "fast"
+	}
+}
+
+func (r *Replica) recordSlowPath(i *Instance) {
+	fmt.Printf("Replica %d went on the slow path\n", r.Id)
+	r.slowPathCount++
+	if i.rowId == r.Id {
+		r.pathByInstance[i.id] = "slow"
+	}
+}
+
+func (r *Replica) ConflictRate() float64 {
+	total := r.fastPathCount + r.slowPathCount
+	if total == 0 {
+		return 0
+	}
+	return float64(r.slowPathCount) / float64(total)
+}
+
+func (r *Replica) logConflictRate() {
+	cr := r.ConflictRate()
+	if glog.V(1) {
+		glog.Infof("Replica[%d]: conflict rate=%.4f slow=%d fast=%d", r.Id, cr, r.slowPathCount, r.fastPathCount)
+	}
 }
 
 // This func initiate a new instance, construct its commands and dependencies
@@ -713,7 +765,8 @@ func (r *Replica) executeList() error {
 		}
 		// return results from state machine are not being used currently
 
-		// TODO: the results from statemachine should be relayed to callback
+		// TODO: the results from state184
+		//  should be relayed to callback
 		//      of some client function
 		_, err := r.StateMachine.Execute(cmdsBuffer)
 		if err != nil {
@@ -722,6 +775,30 @@ func (r *Replica) executeList() error {
 		// TODO: transaction one
 		for _, instance := range sccNodes {
 			instance.SetExecuted()
+			// instrumentation: log end-to-end execution latency for local proposals and cleanup
+			if instance.rowId == r.Id {
+				if start, ok := r.proposalStartTimes[instance.id]; ok {
+					lat := time.Since(start)
+					glog.Infof("Latency[execute] rid=%d iid=%d latency=%s", r.Id, instance.id, lat.String())
+					if path, okp := r.pathByInstance[instance.id]; okp {
+						switch path {
+						case "fast":
+							r.fastLatencyTotal += lat
+							r.fastLatencyCount++
+							avg := r.fastLatencyTotal / time.Duration(r.fastLatencyCount)
+							glog.Infof("AvgLatency[fast] rid=%d count=%d avg=%s", r.Id, r.fastLatencyCount, avg.String())
+						case "slow":
+							r.slowLatencyTotal += lat
+							r.slowLatencyCount++
+							avg := r.slowLatencyTotal / time.Duration(r.slowLatencyCount)
+							glog.Infof("AvgLatency[slow] rid=%d count=%d avg=%s", r.Id, r.slowLatencyCount, avg.String())
+						}
+					}
+					delete(r.proposalStartTimes, instance.id)
+					delete(r.commitTimes, instance.id)
+					delete(r.pathByInstance, instance.id)
+				}
+			}
 		}
 		if r.enablePersistent {
 			r.StoreInstances(sccNodes...)
