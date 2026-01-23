@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/go-distributed/epaxos"
@@ -122,9 +123,10 @@ type Replica struct {
 	store            *persistent.LevelDB
 
 	// instrumentation
+	instrumentMu       sync.Mutex           // protects instrumentation maps
 	proposalStartTimes map[uint64]time.Time // local proposals: iid -> start time
 	commitTimes        map[uint64]time.Time // optional: iid -> commit time
-	pathByInstance     map[uint64]string     // local: iid -> "fast"|"slow"
+	pathByInstance     map[uint64]string    // local: iid -> "fast"|"slow"
 	fastLatencyTotal   time.Duration
 	fastLatencyCount   uint64
 	slowLatencyTotal   time.Duration
@@ -413,7 +415,9 @@ func (r *Replica) batchPropose(batchedRequests *[]*proposeRequest) {
 	proposal := message.NewPropose(r.Id, iid, cmds)
 
 	// instrumentation: record proposal start time for local instance
+	r.instrumentMu.Lock()
 	r.proposalStartTimes[iid] = time.Now()
+	r.instrumentMu.Unlock()
 
 	// update propose num
 	r.ProposeNum++
@@ -553,7 +557,9 @@ func (r *Replica) recordFastPath(i *Instance) {
 	fmt.Printf("Replica %d went on the fast path\n", r.Id)
 	r.fastPathCount++
 	if i.rowId == r.Id {
+		r.instrumentMu.Lock()
 		r.pathByInstance[i.id] = "fast"
+		r.instrumentMu.Unlock()
 	}
 }
 
@@ -561,7 +567,9 @@ func (r *Replica) recordSlowPath(i *Instance) {
 	fmt.Printf("Replica %d went on the slow path\n", r.Id)
 	r.slowPathCount++
 	if i.rowId == r.Id {
+		r.instrumentMu.Lock()
 		r.pathByInstance[i.id] = "slow"
+		r.instrumentMu.Unlock()
 	}
 }
 
@@ -571,6 +579,18 @@ func (r *Replica) ConflictRate() float64 {
 		return 0
 	}
 	return float64(r.slowPathCount) / float64(total)
+}
+
+func (r *Replica) GetFastPathCount() uint64 {
+	return r.fastPathCount
+}
+
+func (r *Replica) GetSlowPathCount() uint64 {
+	return r.slowPathCount
+}
+
+func (r *Replica) GetTotalProposals() uint64 {
+	return r.fastPathCount + r.slowPathCount
 }
 
 func (r *Replica) logConflictRate() {
@@ -777,6 +797,7 @@ func (r *Replica) executeList() error {
 			instance.SetExecuted()
 			// instrumentation: log end-to-end execution latency for local proposals and cleanup
 			if instance.rowId == r.Id {
+				r.instrumentMu.Lock()
 				if start, ok := r.proposalStartTimes[instance.id]; ok {
 					lat := time.Since(start)
 					glog.Infof("Latency[execute] rid=%d iid=%d latency=%s", r.Id, instance.id, lat.String())
@@ -798,6 +819,7 @@ func (r *Replica) executeList() error {
 					delete(r.commitTimes, instance.id)
 					delete(r.pathByInstance, instance.id)
 				}
+				r.instrumentMu.Unlock()
 			}
 		}
 		if r.enablePersistent {

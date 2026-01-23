@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/go-distributed/epaxos/message"
@@ -21,7 +22,7 @@ const (
 	prepareInterval = 1 // 1 seconds
 )
 
-type Voter struct{
+type Voter struct {
 	r *replica.Replica
 }
 
@@ -30,8 +31,9 @@ func (v *Voter) SetReplica(r *replica.Replica) {
 }
 
 // NOTE: This is not idempotent.
-//      Same command might be executed for multiple times
-//      but the exection is slow now, so it is unlikely to happen
+//
+//	Same command might be executed for multiple times
+//	but the exection is slow now, so it is unlikely to happen
 func (v *Voter) Execute(c []message.Command) ([]interface{}, error) {
 	rate := 0.0
 	if v.r != nil {
@@ -54,9 +56,11 @@ func (v *Voter) HaveConflicts(c1 []message.Command, c2 []message.Command) bool {
 func main() {
 	var id int
 	var restore bool
+	var concurrent int
 
 	flag.IntVar(&id, "id", -1, "id of the server")
 	flag.BoolVar(&restore, "restore", false, "if recover")
+	flag.IntVar(&concurrent, "concurrent", 1, "number of concurrent proposers (1 = sequential mode)")
 
 	flag.Parse()
 
@@ -108,16 +112,57 @@ func main() {
 	fmt.Println("====== start ======")
 
 	rand.Seed(time.Now().UTC().UnixNano())
-	counter := 1
-	for i := 0; i < 20; i++ {
-		time.Sleep(time.Second)
-		c := "From: " + strconv.Itoa(id) + ", Command: " + strconv.Itoa(id) + ":" + strconv.Itoa(counter) + ", " + time.Now().String()
-		counter++
 
-		// if(counter <= 20) {
-			cmds := make([]message.Command, 0)
-			cmds = append(cmds, message.Command(c))
-			r.Propose(cmds...)
-		// }
+	numProposers := concurrent
+	if numProposers < 1 {
+		numProposers = 1
 	}
+
+	fmt.Printf("Running with %d concurrent proposer(s)\n", numProposers)
+
+	var wg sync.WaitGroup
+	wg.Add(numProposers)
+
+	for p := 0; p < numProposers; p++ {
+		proposerId := p
+		go func() {
+			defer wg.Done()
+			counter := proposerId * 10000 // offset counters to avoid confusion
+			for i := 0; i < 1000; i++ {
+				time.Sleep(time.Millisecond * 50)
+				c := "From: " + strconv.Itoa(id) + ", Proposer: " + strconv.Itoa(proposerId) + ", Command: " + strconv.Itoa(id) + ":" + strconv.Itoa(counter) + ", " + time.Now().String()
+				counter++
+
+				cmds := make([]message.Command, 0)
+				cmds = append(cmds, message.Command(c))
+				r.Propose(cmds...)
+			}
+		}()
+	}
+
+	// Wait for all proposers to finish
+	wg.Wait()
+
+	// Give some time for all instances to execute
+	time.Sleep(5 * time.Second)
+
+	// Print statistics
+	total := r.GetTotalProposals()
+	fast := r.GetFastPathCount()
+	slow := r.GetSlowPathCount()
+	fastPercent := 0.0
+	slowPercent := 0.0
+
+	if total > 0 {
+		fastPercent = float64(fast) * 100.0 / float64(total)
+		slowPercent = float64(slow) * 100.0 / float64(total)
+	}
+
+	fmt.Println("\n========== STATISTICS ==========")
+	fmt.Printf("Replica ID: %d\n", id)
+	fmt.Printf("Total Proposals: %d\n", total)
+	fmt.Printf("Fast Path: %d (%.2f%%)\n", fast, fastPercent)
+	fmt.Printf("Slow Path: %d (%.2f%%)\n", slow, slowPercent)
+	fmt.Printf("Conflict Rate: %.4f\n", r.ConflictRate())
+	fmt.Println("================================\n")
 }
